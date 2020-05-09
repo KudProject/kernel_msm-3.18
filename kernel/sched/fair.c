@@ -692,6 +692,7 @@ void init_task_runnable_average(struct task_struct *p)
 	p->se.avg.runnable_avg_period = slice;
 	__update_task_entity_contrib(&p->se);
 }
+
 #else
 void init_task_runnable_average(struct task_struct *p)
 {
@@ -2481,12 +2482,41 @@ done:
 	sched_downmigrate = down_migrate;
 }
 
-void set_hmp_defaults(void)
+/*
+ * Unsigned subtract and clamp on underflow.
+ *
+ * Explicitly do a load-store to ensure the intermediate value never hits
+ * memory. This allows lockless observations without ever seeing the negative
+ * values.
+ */
+#define sub_positive(_ptr, _val) do {				\
+	typeof(_ptr) ptr = (_ptr);				\
+	typeof(*ptr) val = (_val);				\
+	typeof(*ptr) res, var = READ_ONCE(*ptr);		\
+	res = var - val;					\
+	if (res > var)						\
+		res = 0;					\
+	WRITE_ONCE(*ptr, res);					\
+} while (0)
+
+/* Group cfs_rq's load_avg is used for task_h_load and update_cfs_share */
+static inline int update_cfs_rq_load_avg(u64 now, struct cfs_rq *cfs_rq)
 {
 	sched_spill_load =
 		pct_to_real(sysctl_sched_spill_load_pct);
 
-	update_up_down_migrate();
+	if (atomic_long_read(&cfs_rq->removed_load_avg)) {
+		long r = atomic_long_xchg(&cfs_rq->removed_load_avg, 0);
+		sub_positive(&sa->load_avg, r);
+		sub_positive(&sa->load_sum, r * LOAD_AVG_MAX);
+		removed = 1;
+	}
+
+	if (atomic_long_read(&cfs_rq->removed_util_avg)) {
+		long r = atomic_long_xchg(&cfs_rq->removed_util_avg, 0);
+		sub_positive(&sa->util_avg, r);
+		sub_positive(&sa->util_sum, r * LOAD_AVG_MAX);
+	}
 
 #ifdef CONFIG_SCHED_FREQ_INPUT
 	sched_major_task_runtime =
@@ -2535,9 +2565,10 @@ int sched_set_init_task_load(struct task_struct *p, int init_load_pct)
 
 #ifdef CONFIG_CGROUP_SCHED
 
-static inline int upmigrate_discouraged(struct task_struct *p)
-{
-	return task_group(p)->upmigrate_discouraged;
+	sub_positive(&cfs_rq->avg.load_avg, se->avg.load_avg);
+	sub_positive(&cfs_rq->avg.load_sum, se->avg.load_sum);
+	sub_positive(&cfs_rq->avg.util_avg, se->avg.util_avg);
+	sub_positive(&cfs_rq->avg.util_sum, se->avg.util_sum);
 }
 
 #else
@@ -6316,19 +6347,24 @@ static long effective_load(struct task_group *tg, int cpu, long wl, long wg)
 		return wl;
 
 	for_each_sched_entity(se) {
-		long w, W;
+		struct cfs_rq *cfs_rq = se->my_q;
+		long W, w = cfs_rq_load_avg(cfs_rq);
 
-		tg = se->my_q->tg;
+		tg = cfs_rq->tg;
 
 		/*
 		 * W = @wg + \Sum rw_j
 		 */
-		W = wg + calc_tg_weight(tg, se->my_q);
+		W = wg + atomic_long_read(&tg->load_avg);
+
+		/* Ensure \Sum rw_j >= rw_i */
+		W -= cfs_rq->tg_load_avg_contrib;
+		W += w;
 
 		/*
 		 * w = rw_i + @wl
 		 */
-		w = se->my_q->load.weight + wl;
+		w += wl;
 
 		/*
 		 * wl = S * s'_i; see (2)

@@ -368,8 +368,7 @@ static bool intel_fb_initial_config(struct drm_fb_helper *fb_helper,
 		return false;
 
 	memcpy(save_enabled, enabled, fb_helper->connector_count);
-	mask = (1 << fb_helper->connector_count) - 1;
-retry:
+
 	for (i = 0; i < fb_helper->connector_count; i++) {
 		struct drm_fb_helper_connector *fb_conn;
 		struct drm_connector *connector;
